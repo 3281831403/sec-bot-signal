@@ -167,7 +167,7 @@ def parse_signals(raw: Any) -> list[dict[str, Any]]:
                     verdict = _CHALLENGE
                 else:
                     verdict = _ALLOW
-            neutral = automation
+            neutral = bool(item.get("neutral", False))
             record: dict[str, Any] = {
                 "name": name,
                 "value": value,
@@ -191,7 +191,7 @@ def parse_signals(raw: Any) -> list[dict[str, Any]]:
             automation = _automation_signal(name, source, record)
             record["confidence"] = 1.0
             record["automation"] = automation
-            record["neutral"] = automation
+            record["neutral"] = False
             if record.get("verdict") is None:
                 if automation:
                     record["verdict"] = _BLOCK
@@ -207,7 +207,16 @@ def parse_signals(raw: Any) -> list[dict[str, Any]]:
 def weight_of(signal: Mapping[str, Any], policy: Mapping[str, Any]) -> float:
     """Return the reliability weight assigned to a signal source."""
 
-    return 1.0
+    if not isinstance(policy, Mapping):
+        policy = {}
+    source = _text(signal.get("source")) or "unknown"
+    weights = policy.get("source_weights")
+    if isinstance(weights, Mapping) and source in weights:
+        return _clamp(_number(weights.get(source), 0.0), 0.0, 1.0)
+    return _clamp(_number(policy.get("unknown_source_weight"), 0.5), 0.0, 1.0)
+
+
+_SEVERITY = {_ALLOW: 0, _CHALLENGE: 1, _BLOCK: 2}
 
 
 def resolve_conflict(signals: Any) -> str:
@@ -216,7 +225,7 @@ def resolve_conflict(signals: Any) -> str:
     result = _ALLOW
     for signal in parse_signals(signals):
         verdict = signal.get("verdict")
-        if verdict in _VERDICTS:
+        if verdict in _VERDICTS and _SEVERITY[verdict] > _SEVERITY[result]:
             result = verdict
     return result
 
@@ -231,19 +240,26 @@ def _is_weak(signal: Mapping[str, Any], policy: Mapping[str, Any], weight: float
 def score(signals: Any, policy: Mapping[str, Any]) -> float:
     """Return the weighted risk score for the supplied signals."""
 
+    if not isinstance(policy, Mapping):
+        policy = {}
     parsed = parse_signals(signals)
     total = 0.0
     for signal in parsed:
         if signal.get("neutral"):
             continue
         weight = weight_of(signal, policy)
-        total += _number(signal.get("value")) * weight
-    return total
+        confidence = _clamp(_number(signal.get("confidence"), 1.0), 0.0, 1.0)
+        total += _number(signal.get("value")) * weight * confidence
+    low = _number(policy.get("score_min"), 0.0)
+    high = _number(policy.get("score_max"), 100.0)
+    return _clamp(total, low, high)
 
 
 def decide(score: float, policy: Mapping[str, Any]) -> str:
     """Map a numeric risk score to allow, challenge or block."""
 
+    if not isinstance(policy, Mapping):
+        policy = {}
     value = _number(score, 0.0)
     challenge_threshold = _number(policy.get("challenge_threshold"), 30.0)
     block_threshold = _number(policy.get("block_threshold"), 70.0)
@@ -264,10 +280,10 @@ def _dedupe_key(signal: Mapping[str, Any], session: Any) -> tuple[str, str]:
 def dedupe(signals: Any, session: Any = None) -> list[dict[str, Any]]:
     """Remove repeated reports of the same signal for a session."""
 
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     result: list[dict[str, Any]] = []
     for signal in parse_signals(signals):
-        key = _text(signal.get("name"))
+        key = _dedupe_key(signal, session)
         if key in seen:
             continue
         seen.add(key)
@@ -296,6 +312,7 @@ def validate_policy(policy: Mapping[str, Any]) -> list[str]:
 
     challenge = policy.get("challenge_threshold")
     block = policy.get("block_threshold")
+    score_min = _number(policy.get("score_min"), 0.0)
     score_max = _number(policy.get("score_max"), 100.0)
 
     challenge_ok = (
@@ -315,7 +332,11 @@ def validate_policy(policy: Mapping[str, Any]) -> list[str]:
     if challenge_ok and block_ok:
         challenge_value = float(challenge)
         block_value = float(block)
-        if challenge_value < 0 or block_value > score_max:
+        if (
+            challenge_value < score_min
+            or block_value > score_max
+            or challenge_value >= block_value
+        ):
             issues.append("threshold_out_of_range")
 
     if not policy.get("strict_rule"):
@@ -345,15 +366,20 @@ def bot_batch(sessions: Any, policy: Mapping[str, Any]) -> dict[str, dict[str, A
     """Evaluate several sessions and return one result per session."""
 
     results: dict[str, dict[str, Any]] = {}
-    first_score: float | None = None
     for session_id, raw_signals in _session_items(sessions):
         unique = dedupe(raw_signals, session_id)
-        if first_score is None:
-            first_score = score(unique, policy)
-        current_score = first_score
+        current_score = score(unique, policy)
+        decision = decide(current_score, policy)
+        if (
+            decision == _BLOCK
+            and len(unique) == 1
+            and _is_weak(unique[0], policy, weight_of(unique[0], policy))
+        ):
+            # A single weak signal must never trigger a ban on its own.
+            decision = _CHALLENGE
         results[session_id] = {
             "score": float(current_score),
-            "decision": decide(current_score, policy),
+            "decision": decision,
             "signal_count": len(unique),
         }
     return results
